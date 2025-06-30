@@ -1,0 +1,7 @@
+bleak
+screeninfo
+aiohttp
+sounddevice
+numpy
+scipy
+python-dotenv 

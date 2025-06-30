@@ -23,11 +23,17 @@ uint32_t p = 500000, i = 0, d = 10000000;
 enum ModeType
 {
   MODE_TARGET,
-  MODE_SET
+  MODE_SET,
+  MODE_SET_TO_TARGET // 追加: set→targetへ遷移待ち用
 };
 ModeType currentMode = MODE_TARGET;
 
 int32_t prevEncoder = 0;
+
+unsigned long setStartTime = 0;    // setモード開始時刻
+unsigned long hitTime = 0;         // ヒット時刻
+bool hitOccurred = false;          // どちらかがヒットしたか
+unsigned long targetStartTime = 0; // targetモード開始時刻
 
 // The SERVICE_UUID must be unique for each device.
 // The last part can be changed for each target (e.g., ...D0, ...D1, ...D2)
@@ -60,11 +66,19 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
     {
       if (rxValue == "target")
       {
-        M5.Lcd.fillScreen(BLACK);
+        // target受信時、まずsetモードに遷移し、2秒後にtargetモードへ
+        currentMode = MODE_SET_TO_TARGET;
+        setStartTime = millis();
+        M5.Lcd.fillScreen(BLUE);
+        M5.Lcd.setCursor(0, 0);
+        M5.Lcd.println("Mode: set (auto→target)");
       }
       else if (rxValue == "set")
       {
+        currentMode = MODE_SET;
         M5.Lcd.fillScreen(BLUE);
+        M5.Lcd.setCursor(0, 0);
+        M5.Lcd.println("Mode: set");
       }
       else
       {
@@ -72,20 +86,6 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks
       }
       M5.Lcd.setCursor(0, 0);
       M5.Lcd.printf("Received: %s\n", rxValue.c_str());
-      // モード切替
-      if (rxValue == "target")
-      {
-        currentMode = MODE_TARGET;
-        M5.Lcd.println("Mode: target");
-      }
-      else if (rxValue == "set")
-      {
-        currentMode = MODE_SET;
-        M5.Lcd.println("Mode: set");
-      }
-      else
-      {
-      }
     }
   }
 };
@@ -162,6 +162,39 @@ void loop()
   }
   lastBtn = btn;
 
+  // set→target自動遷移処理
+  if (currentMode == MODE_SET_TO_TARGET)
+  {
+    // setモードの処理（MODE_SETと同じ）
+    if (prevMode != MODE_SET_TO_TARGET)
+    {
+      RollerI2C_64.setRGBMode(ROLLER_RGB_MODE_USER_DEFINED);
+      RollerI2C_64.setRGB(0xFFE0); // 黄色
+      RollerI2C_63.setRGBMode(ROLLER_RGB_MODE_USER_DEFINED);
+      RollerI2C_63.setRGB(0xFFE0); // 黄色
+      hit_64 = false;
+      hit_63 = false;
+      prevMode = MODE_SET_TO_TARGET;
+      M5.Lcd.fillScreen(BLUE);
+    }
+    RollerI2C_64.setMode(ROLLER_MODE_POSITION);
+    RollerI2C_64.setPosMaxCurrent(200000);
+    RollerI2C_64.setPos(18890);
+    RollerI2C_64.setOutput(1);
+    RollerI2C_63.setMode(ROLLER_MODE_POSITION);
+    RollerI2C_63.setPosMaxCurrent(200000);
+    RollerI2C_63.setPos(-21700);
+    RollerI2C_63.setOutput(1);
+    // 2秒経過したらtargetモードへ
+    if (millis() - setStartTime >= 2000)
+    {
+      currentMode = MODE_TARGET;
+      prevMode = MODE_SET_TO_TARGET; // すぐにMODE_TARGETの初期化が走るように
+    }
+    delay(10);
+    return;
+  }
+
   if (currentMode == MODE_TARGET)
   {
     // targetモードに入った瞬間、基準値を保存
@@ -171,8 +204,14 @@ void loop()
       baseEncoder_63 = RollerI2C_63.getPosReadback();
       hit_64 = false;
       hit_63 = false;
+      hitOccurred = false;
       prevMode = MODE_TARGET;
       M5.Lcd.fillScreen(BLACK);
+      RollerI2C_64.setRGBMode(ROLLER_RGB_MODE_USER_DEFINED);
+      RollerI2C_64.setRGB(0x07E0); // 緑
+      RollerI2C_63.setRGBMode(ROLLER_RGB_MODE_USER_DEFINED);
+      RollerI2C_63.setRGB(0x07E0); // 緑
+      targetStartTime = millis();
     }
     RollerI2C_64.setOutput(0);
     RollerI2C_63.setOutput(0);
@@ -186,9 +225,17 @@ void loop()
       M5.Lcd.fillScreen(BLACK);
       M5.Lcd.setCursor(0, 0);
       M5.Lcd.println("HIT! 64");
-      // Notify送信
-      pCharacteristic->setValue("hit_64");
+      // Notify送信（経過秒数付き）
+      float elapsed = (millis() - targetStartTime) / 1000.0f;
+      char buf[32];
+      snprintf(buf, sizeof(buf), "hit_64,%.2f", elapsed);
+      pCharacteristic->setValue(buf);
       pCharacteristic->notify();
+      if (!hitOccurred)
+      {
+        hitTime = millis();
+        hitOccurred = true;
+      }
     }
     if (!hit_63 && abs(delta_63) >= 3000)
     {
@@ -198,9 +245,26 @@ void loop()
       M5.Lcd.fillScreen(BLACK);
       M5.Lcd.setCursor(0, 0);
       M5.Lcd.println("HIT! 63");
-      // Notify送信
-      pCharacteristic->setValue("hit_63");
+      // Notify送信（経過秒数付き）
+      float elapsed = (millis() - targetStartTime) / 1000.0f;
+      char buf[32];
+      snprintf(buf, sizeof(buf), "hit_63,%.2f", elapsed);
+      pCharacteristic->setValue(buf);
       pCharacteristic->notify();
+      if (!hitOccurred)
+      {
+        hitTime = millis();
+        hitOccurred = true;
+      }
+    }
+    // どちらかヒット後5秒で両方赤
+    if (hitOccurred && millis() - hitTime >= 5000)
+    {
+      RollerI2C_64.setRGBMode(ROLLER_RGB_MODE_USER_DEFINED);
+      RollerI2C_64.setRGB(0xFFFF); // 白
+      RollerI2C_63.setRGBMode(ROLLER_RGB_MODE_USER_DEFINED);
+      RollerI2C_63.setRGB(0xFFFF); // 白
+      hitOccurred = false;         // 一度だけ実行
     }
     delay(10);
   }
@@ -210,9 +274,9 @@ void loop()
     if (prevMode != MODE_SET)
     {
       RollerI2C_64.setRGBMode(ROLLER_RGB_MODE_USER_DEFINED);
-      RollerI2C_64.setRGB(0x07E0); // 緑
+      RollerI2C_64.setRGB(0xFFE0); // 黄色
       RollerI2C_63.setRGBMode(ROLLER_RGB_MODE_USER_DEFINED);
-      RollerI2C_63.setRGB(0x07E0); // 緑
+      RollerI2C_63.setRGB(0xFFE0); // 黄色
       hit_64 = false;
       hit_63 = false;
       prevMode = MODE_SET;
